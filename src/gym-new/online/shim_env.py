@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gym
-from gym import spaces
-from gym.utils import seeding
-from gym.envs.registration import register
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.utils import seeding
+from gymnasium.envs.registration import register
 import numpy as np
 import ast
 import heapq

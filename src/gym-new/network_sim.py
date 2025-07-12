@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import gym
-from gym import spaces
-from gym.utils import seeding
-from gym.envs.registration import register
+import gymnasium as gym
+from gymnasium import spaces
+from gymnasium.utils import seeding
+from gymnasium.envs.registration import register
 import numpy as np
 import heapq
 import time
@@ -62,6 +62,8 @@ class Link():
         self.queue_delay = 0.0
         self.queue_delay_update_time = 0.0
         self.max_queue_delay = queue_size / self.bw
+        self.queue_length = 0 # TODO: add functions to change these 
+        self.utilization = 0.0
 
     def get_cur_queue_delay(self, event_time):
         return max(0.0, self.queue_delay - (event_time - self.queue_delay_update_time))
@@ -120,7 +122,7 @@ class Network():
     def get_cur_time(self):
         return self.cur_time
 
-    def run_for_dur(self, dur):
+    def run_for_dur(self, dur): # TODO: Add a parameter to events that gives the INT on the packet 
         end_time = self.cur_time + dur
         for sender in self.senders:
             sender.reset_obs()
@@ -374,16 +376,16 @@ class SimulatedNetworkEnv(gym.Env):
         self.last_rate = None
 
         if USE_CWND:
-            self.action_space = spaces.Box(np.array([-1e12, -1e12]), np.array([1e12, 1e12]), dtype=np.float32)
+            self.action_space = gym.spaces.Box(np.array([-1e12, -1e12]), np.array([1e12, 1e12]), dtype=np.float32)
         else:
-            self.action_space = spaces.Box(np.array([-1e12]), np.array([1e12]), dtype=np.float32)
+            self.action_space = gym.spaces.Box(np.array([-1e12]), np.array([1e12]), dtype=np.float32)
                    
 
         self.observation_space = None
         use_only_scale_free = True
         single_obs_min_vec = sender_obs.get_min_obs_vector(self.features)
         single_obs_max_vec = sender_obs.get_max_obs_vector(self.features)
-        self.observation_space = spaces.Box(np.tile(single_obs_min_vec, self.history_len),
+        self.observation_space = gym.spaces.Box(np.tile(single_obs_min_vec, self.history_len),
                                             np.tile(single_obs_max_vec, self.history_len),
                                             dtype=np.float32)
 
@@ -394,7 +396,7 @@ class SimulatedNetworkEnv(gym.Env):
         self.episodes_run = -1
 
     def seed(self, seed=None):
-        self.rand, seed = seeding.np_random(seed)
+        self.rand, seed = gym.utils.seeding.np_random(seed)
         return [seed]
 
     def _get_all_sender_obs(self):
@@ -421,16 +423,16 @@ class SimulatedNetworkEnv(gym.Env):
         sender_mi = self.senders[0].get_run_data()
         event = {}
         event["Name"] = "Step"
-        event["Time"] = self.steps_taken
-        event["Reward"] = reward
+        event["Time"] = float(self.steps_taken)
+        event["Reward"] = float(reward)
         #event["Target Rate"] = sender_mi.target_rate
-        event["Send Rate"] = sender_mi.get("send rate")
-        event["Throughput"] = sender_mi.get("recv rate")
-        event["Latency"] = sender_mi.get("avg latency")
-        event["Loss Rate"] = sender_mi.get("loss ratio")
-        event["Latency Inflation"] = sender_mi.get("sent latency inflation")
-        event["Latency Ratio"] = sender_mi.get("latency ratio")
-        event["Send Ratio"] = sender_mi.get("send ratio")
+        event["Send Rate"] = float(sender_mi.get("send rate"))
+        event["Throughput"] = float(sender_mi.get("recv rate"))
+        event["Latency"] = float(sender_mi.get("avg latency"))
+        event["Loss Rate"] = float(sender_mi.get("loss ratio"))
+        event["Latency Inflation"] = float(sender_mi.get("sent latency inflation"))
+        event["Latency Ratio"] = float(sender_mi.get("latency ratio"))
+        event["Send Ratio"] = float(sender_mi.get("send ratio"))
         #event["Cwnd"] = sender_mi.cwnd
         #event["Cwnd Used"] = sender_mi.cwnd_used
         self.event_record["Events"].append(event)
@@ -441,7 +443,7 @@ class SimulatedNetworkEnv(gym.Env):
         should_stop = False
 
         self.reward_sum += reward
-        return sender_obs, reward, (self.steps_taken >= self.max_steps or should_stop), {}
+        return sender_obs, reward, (self.steps_taken >= self.max_steps or should_stop), False, {}
 
     def print_debug(self):
         print("---Link Debug---")
@@ -466,14 +468,16 @@ class SimulatedNetworkEnv(gym.Env):
         self.senders = [Sender(random.uniform(0.3, 1.5) * bw, [self.links[0], self.links[1]], 0, self.features, history_len=self.history_len)]
         self.run_dur = 3 * lat
 
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
         self.steps_taken = 0
         self.net.reset()
         self.create_new_links_and_senders()
         self.net = Network(self.senders, self.links)
         self.episodes_run += 1
-        if self.episodes_run > 0 and self.episodes_run % 100 == 0:
-            self.dump_events_to_file("pcc_env_log_run_%d.json" % self.episodes_run)
+        # if self.episodes_run > 0 and self.episodes_run % 100 == 0:
+        #     self.dump_events_to_file("pcc_env_log_run_%d.json" % self.episodes_run)
         self.event_record = {"Events":[]}
         self.net.run_for_dur(self.run_dur)
         self.net.run_for_dur(self.run_dur)
@@ -481,7 +485,10 @@ class SimulatedNetworkEnv(gym.Env):
         self.reward_ewma += 0.01 * self.reward_sum
         print("Reward: %0.2f, Ewma Reward: %0.2f" % (self.reward_sum, self.reward_ewma))
         self.reward_sum = 0.0
-        return self._get_all_sender_obs()
+
+        obs = self._get_all_sender_obs()
+        info = {}
+        return obs, info
 
     def render(self, mode='human'):
         pass
@@ -495,6 +502,6 @@ class SimulatedNetworkEnv(gym.Env):
         with open(filename, 'w') as f:
             json.dump(self.event_record, f, indent=4)
 
-register(id='PccNs-v0', entry_point='network_sim:SimulatedNetworkEnv')
+gym.envs.registration.register(id='PccNs-v0', entry_point='network_sim:SimulatedNetworkEnv')
 #env = SimulatedNetworkEnv()
 #env.step([1.0])
