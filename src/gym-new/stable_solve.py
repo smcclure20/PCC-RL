@@ -35,7 +35,11 @@ else:
 print("Architecture is: %s" % str(arch))
 
 training_sess = None
-
+config_file = arg_or_default("--config", default="/home/eecs/sarah/remy/configs/config0211.cfg")
+name = arg_or_default("--name", default="test_run")
+print(name)
+print("Will save model to ./results/%s/" % name )
+features = arg_or_default("--features", default="send rate,recv rate,latency ratio")
 # class MyMlpPolicy(FeedForwardPolicy):
 
 #     def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, reuse=False, **_kwargs):
@@ -44,21 +48,24 @@ training_sess = None
 #         global training_sess
 #         training_sess = sess
 
-env = gym.make('PccNs-v0')
-#env = gym.make('CartPole-v0')
+env = gym.make('PccNs-v0', config=config_file, features=features)
+# #env = gym.make('CartPole-v0')
 
 gamma = arg_or_default("--gamma", default=0.99)
 print("gamma = %f" % gamma)
-model = PPO("MlpPolicy", env, verbose=1, batch_size=2048, gamma=gamma)
-
+model = PPO("MlpPolicy", env, verbose=1, gamma=gamma, batch_size=10000, n_steps=10000) #, n_steps=10000) # With MAX_STEPS=10000, the model will update 1 times per simulation in ~5 batches
+# model = PPO.load("/home/eecs/sarah/PCC-RL/src/gym-new/results/cfg0211-noint-newtime-10k-10ksteps-10kb/pcc_model_ckpt0.zip", env) #TODO:Update the scrip tto optionally load from a checkpoint
 # for i in range(0, 6):
 #     with model.graph.as_default():                                                                   
 #         saver = tf.train.Saver()                                                                     
 #         saver.save(training_sess, "./pcc_model_%d.ckpt" % i)
-model.learn(total_timesteps=(1600 * 410))
+# model.learn(total_timesteps=(1600 * 10000 * 6))
+os.makedirs("./results/{}".format(name), exist_ok=True)
+for i in range(0,6):
+    model.learn(total_timesteps=(1600 * 10000))
+    model.save("./results/{}/pcc_model_ckpt{}.zip".format(name, i))
 
-
-model.save("./results/pcc-model/")
+# model.save("./results/{}/".format(name))
 # ##
 # #   Save the model to the location specified below.
 # ##

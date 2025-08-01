@@ -28,7 +28,9 @@ class SenderMonitorInterval():
                  recv_start=0.0,
                  recv_end=0.0,
                  rtt_samples=[],
-                 packet_size=1500):
+                 packet_size=1500,
+                 last_queue=0.0,
+                 last_util=0.0):
         self.features = {}
         self.sender_id = sender_id
         self.bytes_acked = bytes_acked
@@ -40,6 +42,8 @@ class SenderMonitorInterval():
         self.recv_end = recv_end
         self.rtt_samples = rtt_samples
         self.packet_size = packet_size
+        self.last_queue = last_queue
+        self.last_link_util = last_util
 
     def get(self, feature):
         if feature in self.features.keys():
@@ -110,7 +114,7 @@ def get_max_obs_vector(feature_names):
 def _mi_metric_recv_rate(mi):
     dur = mi.get("recv dur")
     if dur > 0.0:
-        return 8.0 * (mi.bytes_acked - mi.packet_size) / dur
+        return ((mi.bytes_acked / mi.packet_size)) / dur # packets per time
     return 0.0
 
 def _mi_metric_recv_dur(mi):
@@ -124,7 +128,7 @@ def _mi_metric_avg_latency(mi):
 def _mi_metric_send_rate(mi):
     dur = mi.get("send dur")
     if dur > 0.0:
-        return 8.0 * mi.bytes_sent / dur
+        return (mi.bytes_sent / mi.packet_size) / dur # packets per time
     return 0.0
 
 def _mi_metric_send_dur(mi):
@@ -190,9 +194,15 @@ def _mi_metric_latency_ratio(mi):
         return cur_lat / min_lat
     return 1.0
 
+def _mi_metric_last_queue(mi):
+    return mi.last_queue
+
+def _mi_metric_last_link_util(mi):
+    return mi.last_link_util
+
 SENDER_MI_METRICS = [
-    SenderMonitorIntervalMetric("send rate", _mi_metric_send_rate, 0.0, 1e9, 1e7),
-    SenderMonitorIntervalMetric("recv rate", _mi_metric_recv_rate, 0.0, 1e9, 1e7),
+    SenderMonitorIntervalMetric("send rate", _mi_metric_send_rate, 0.0, 10, 0.001),
+    SenderMonitorIntervalMetric("recv rate", _mi_metric_recv_rate, 0.0, 10, 0.001),
     SenderMonitorIntervalMetric("recv dur", _mi_metric_recv_dur, 0.0, 100.0),
     SenderMonitorIntervalMetric("send dur", _mi_metric_send_dur, 0.0, 100.0),
     SenderMonitorIntervalMetric("avg latency", _mi_metric_avg_latency, 0.0, 100.0),
@@ -202,7 +212,9 @@ SENDER_MI_METRICS = [
     SenderMonitorIntervalMetric("conn min latency", _mi_metric_conn_min_latency, 0.0, 100.0),
     SenderMonitorIntervalMetric("latency increase", _mi_metric_latency_increase, 0.0, 100.0),
     SenderMonitorIntervalMetric("latency ratio", _mi_metric_latency_ratio, 1.0, 10000.0),
-    SenderMonitorIntervalMetric("send ratio", _mi_metric_send_ratio, 0.0, 1000.0)
+    SenderMonitorIntervalMetric("send ratio", _mi_metric_send_ratio, 0.0, 1000.0),
+    SenderMonitorIntervalMetric("last queue", _mi_metric_last_queue, 0.0, 1000.0, 1.0),
+    SenderMonitorIntervalMetric("last link util", _mi_metric_last_link_util, 0.0, 1.0, 0.0001),
 ]
 
 

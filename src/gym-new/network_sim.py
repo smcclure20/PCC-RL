@@ -24,21 +24,23 @@ import json
 import os
 import sys
 import inspect
+from math import log2, floor
 currentdir = os.path.dirname(os.path.abspath(inspect.getfile(inspect.currentframe())))
 parentdir = os.path.dirname(currentdir)
 sys.path.insert(0,parentdir) 
 from common import sender_obs, config
 from common.simple_arg_parse import arg_or_default
+from netconfig.remy_config import load_remy_config
 
 MAX_CWND = 5000
 MIN_CWND = 4
 
-MAX_RATE = 1000
-MIN_RATE = 40
+MAX_RATE = 10 # packets per ms
+MIN_RATE = 0.01
 
 REWARD_SCALE = 0.001
 
-MAX_STEPS = 400
+MAX_STEPS = 10000
 
 EVENT_TYPE_SEND = 'S'
 EVENT_TYPE_ACK = 'A'
@@ -51,7 +53,9 @@ LOSS_PENALTY = 1.0
 USE_LATENCY_NOISE = False
 MAX_LATENCY_NOISE = 1.1
 
-USE_CWND = False
+USE_CWND = True
+
+# TODO: Set this up to use remy network configs
 
 class Link():
 
@@ -64,12 +68,40 @@ class Link():
         self.max_queue_delay = queue_size / self.bw
         self.queue_length = 0 # TODO: add functions to change these 
         self.utilization = 0.0
+        self.utilization_window = 10
+        self.packet_counters = [0] * 10
+        self._last_packet_time = 0.0
+        self._current_bucket = 0
+
+    def get_cur_link_util(self):
+        return ((sum(self.packet_counters) * BYTES_PER_PACKET) / self.utilization_window) / self.bw
 
     def get_cur_queue_delay(self, event_time):
         return max(0.0, self.queue_delay - (event_time - self.queue_delay_update_time))
 
     def get_cur_latency(self, event_time):
-        return self.dl + self.get_cur_queue_delay(event_time)
+        return self.dl + self.get_cur_queue_delay(event_time) 
+
+    def add_packet_to_counter(self, time, extra_delay):
+        bucket = floor((time + extra_delay)%self.utilization_window)
+
+        # If there hasn't been a packet in the last recording interval, 0 everything
+        if (time - self._last_packet_time > self.utilization_window):
+            for i in range(len(self.packet_counters)):
+                self.packet_counters[i] = 0
+        
+        gap = ((bucket + 10) - self._current_bucket) % 10
+
+        # Zero out any buckets between the current bucket and the event bucket
+        while (gap > 0):
+            self._current_bucket += 1
+            self._current_bucket = self._current_bucket % 10
+            self.packet_counters[self._current_bucket] = 0
+            gap = ((bucket + 10) - self._current_bucket) % 10
+
+        # Add to the counter
+        self.packet_counters[self._current_bucket] += 1
+        self._last_packet_time = time + extra_delay
 
     def packet_enters_link(self, event_time):
         if (random.random() < self.lr):
@@ -81,7 +113,10 @@ class Link():
         if extra_delay + self.queue_delay > self.max_queue_delay:
             #print("\tDrop!")
             return False
+        
         self.queue_delay += extra_delay
+        self.queue_length = self.queue_delay * self.bw
+        self.add_packet_to_counter(event_time, extra_delay)
         #print("\tNew delay = %f" % self.queue_delay)
         return True
 
@@ -96,6 +131,7 @@ class Link():
     def reset(self):
         self.queue_delay = 0.0
         self.queue_delay_update_time = 0.0
+        self.queue_length = 0
 
 class Network():
     
@@ -110,7 +146,7 @@ class Network():
         for sender in self.senders:
             sender.register_network(self)
             sender.reset_obs()
-            heapq.heappush(self.q, (1.0 / sender.rate, sender, EVENT_TYPE_SEND, 0, 0.0, False)) 
+            heapq.heappush(self.q, (1.0 / sender.rate, sender, EVENT_TYPE_SEND, 0, 0.0, False, 0, 0)) 
 
     def reset(self):
         self.cur_time = 0.0
@@ -128,7 +164,7 @@ class Network():
             sender.reset_obs()
 
         while self.cur_time < end_time:
-            event_time, sender, event_type, next_hop, cur_latency, dropped = heapq.heappop(self.q)
+            event_time, sender, event_type, next_hop, cur_latency, dropped, queue_len, link_util = heapq.heappop(self.q)
             #print("Got event %s, to link %d, latency %f at time %f" % (event_type, next_hop, cur_latency, event_time))
             self.cur_time = event_time
             new_event_time = event_time
@@ -136,6 +172,8 @@ class Network():
             new_next_hop = next_hop
             new_latency = cur_latency
             new_dropped = dropped
+            new_queue_len = queue_len
+            new_link_util = link_util
             push_new_event = False
 
             if event_type == EVENT_TYPE_ACK:
@@ -144,7 +182,7 @@ class Network():
                         sender.on_packet_lost()
                         #print("Packet lost at time %f" % self.cur_time)
                     else:
-                        sender.on_packet_acked(cur_latency)
+                        sender.on_packet_acked(cur_latency, queue_len, link_util)
                         #print("Packet acked at time %f" % self.cur_time)
                 else:
                     new_next_hop = next_hop + 1
@@ -160,7 +198,7 @@ class Network():
                     if sender.can_send_packet():
                         sender.on_packet_sent()
                         push_new_event = True
-                    heapq.heappush(self.q, (self.cur_time + (1.0 / sender.rate), sender, EVENT_TYPE_SEND, 0, 0.0, False))
+                    heapq.heappush(self.q, (self.cur_time + (1.0 / sender.rate), sender, EVENT_TYPE_SEND, 0, 0.0, False, 0, 0))
                 
                 else:
                     push_new_event = True
@@ -175,9 +213,11 @@ class Network():
                 new_latency += link_latency
                 new_event_time += link_latency
                 new_dropped = not sender.path[next_hop].packet_enters_link(self.cur_time)
+                new_queue_len = max(queue_len, sender.path[next_hop].queue_length)
+                new_link_util = max(link_util, sender.path[next_hop].get_cur_link_util())
                    
             if push_new_event:
-                heapq.heappush(self.q, (new_event_time, sender, new_event_type, new_next_hop, new_latency, new_dropped))
+                heapq.heappush(self.q, (new_event_time, sender, new_event_type, new_next_hop, new_latency, new_dropped, new_queue_len, new_link_util))
 
         sender_mi = self.senders[0].get_run_data()
         throughput = sender_mi.get("recv rate")
@@ -193,7 +233,16 @@ class Network():
         #reward = REWARD_SCALE * (20.0 * throughput / RATE_OBS_SCALE - 1e3 * latency / LAT_OBS_SCALE - 2e3 * loss)
         
         # Very high thpt
-        reward = (10.0 * throughput / (8 * BYTES_PER_PACKET) - 1e3 * latency - 2e3 * loss)
+        # reward = (10.0 * throughput / (8 * BYTES_PER_PACKET) - 1e3 * latency - 2e3 * loss)
+
+        # Remy-based
+        tput_ppt = throughput # Packets per ms TODO: Maybe this should be averaged more (eg, over the whole sim)
+        if tput_ppt <= 0.0:
+            tput_ppt = 0.00001
+        if latency <= 0.0:
+            latency = 0.00001
+        reward = log2(tput_ppt/self.links[0].bw) - log2(latency/100)
+        # print("Reward = %f, thpt = %f, lat = %f, loss = %f" % (reward, throughput, latency, loss))
         
         # High thpt
         #reward = REWARD_SCALE * (5.0 * throughput / RATE_OBS_SCALE - 1e3 * latency / LAT_OBS_SCALE - 2e3 * loss)
@@ -219,6 +268,7 @@ class Sender():
         self.min_latency = None
         self.rtt_samples = []
         self.sample_time = []
+        self.last_queue = 0
         self.net = None
         self.path = path
         self.dest = dest
@@ -263,12 +313,14 @@ class Sender():
         self.sent += 1
         self.bytes_in_flight += BYTES_PER_PACKET
 
-    def on_packet_acked(self, rtt):
+    def on_packet_acked(self, rtt, queue_len, link_util):
         self.acked += 1
         self.rtt_samples.append(rtt)
         if (self.min_latency is None) or (rtt < self.min_latency):
             self.min_latency = rtt
         self.bytes_in_flight -= BYTES_PER_PACKET
+        self.last_queue = queue_len
+        self.last_link_util = link_util
 
     def on_packet_lost(self):
         self.lost += 1
@@ -315,13 +367,15 @@ class Sender():
             recv_start=self.obs_start_time,
             recv_end=obs_end_time,
             rtt_samples=self.rtt_samples,
-            packet_size=BYTES_PER_PACKET
+            packet_size=BYTES_PER_PACKET,
+            last_queue=self.last_queue
         )
 
     def reset_obs(self):
         self.sent = 0
         self.acked = 0
         self.lost = 0
+        self.last_queue = 0
         self.rtt_samples = []
         self.obs_start_time = self.net.get_cur_time()
 
@@ -333,6 +387,7 @@ class Sender():
         print("Acked: %d" % self.acked)
         print("Lost: %d" % self.lost)
         print("Min Latency: %s" % str(self.min_latency))
+        print("Last Queue: %d" % self.last_queue)
 
     def reset(self):
         #print("Resetting sender!")
@@ -348,16 +403,33 @@ class SimulatedNetworkEnv(gym.Env):
     def __init__(self,
                  history_len=arg_or_default("--history-len", default=10),
                  features=arg_or_default("--input-features",
-                    default="sent latency inflation,"
-                          + "latency ratio,"
-                          + "send ratio")):
+                    default="send rate,"
+                          + "recv rate,"
+                          + "latency ratio"), config=arg_or_default("--config", default="")): # + "last queue")):
         self.viewer = None
         self.rand = None
 
-        self.min_bw, self.max_bw = (100, 500)
-        self.min_lat, self.max_lat = (0.05, 0.5)
-        self.min_queue, self.max_queue = (0, 8)
-        self.min_loss, self.max_loss = (0.0, 0.05)
+        if config != "":
+            cf = load_remy_config(config)
+            print("Loaded remy config from %s" % config)
+        
+            self.min_bw = cf.link_packets_per_ms.low # / 0.001 # NOTE: assume the sim is in time = s
+            self.max_bw = cf.link_packets_per_ms.high # / 0.001
+            self.min_lat = cf.rtt.low # / 1000.0
+            self.max_lat = cf.rtt.high # / 1000.0
+            self.min_queue = cf.buffer_size.low
+            self.max_queue = cf.buffer_size.high
+            self.min_loss = cf.stochastic_loss_rate.low
+            self.max_loss = cf.stochastic_loss_rate.high
+            print("Bandwidth range: %f - %f" % (self.min_bw, self.max_bw))
+            print("Latency range: %f - %f" % (self.min_lat, self.max_lat))
+            print("Queue range: %f - %f" % (self.min_queue, self.max_queue))
+            print("Loss range: %f - %f" % (self.min_loss, self.max_loss))
+        else:
+            self.min_bw, self.max_bw = (100, 500)
+            self.min_lat, self.max_lat = (0.05, 0.5)
+            self.min_queue, self.max_queue = (0, 8)
+            self.min_loss, self.max_loss = (0.0, 0.05)
         self.history_len = history_len
         print("History length: %d" % history_len)
         self.features = features.split(",")
@@ -400,13 +472,13 @@ class SimulatedNetworkEnv(gym.Env):
         return [seed]
 
     def _get_all_sender_obs(self):
-        sender_obs = self.senders[0].get_obs()
+        sender_obs = self.senders[0].get_obs() # There are probably many instances where it assumes there is only one sender TODO find these and fix
         sender_obs = np.array(sender_obs).reshape(-1,)
-        #print(sender_obs)
+        # print(sender_obs)
         return sender_obs
 
     def step(self, actions):
-        #print("Actions: %s" % str(actions))
+        # print("Actions: %s" % str(actions))
         #print(actions)
         for i in range(0, 1):#len(actions)):
             #print("Updating rate for sender %d" % i)
@@ -414,7 +486,7 @@ class SimulatedNetworkEnv(gym.Env):
             self.senders[i].apply_rate_delta(action[0])
             if USE_CWND:
                 self.senders[i].apply_cwnd_delta(action[1])
-        #print("Running for %fs" % self.run_dur)
+        # print("Running for %fs" % self.run_dur)
         reward = self.net.run_for_dur(self.run_dur)
         for sender in self.senders:
             sender.record_run()
@@ -433,12 +505,13 @@ class SimulatedNetworkEnv(gym.Env):
         event["Latency Inflation"] = float(sender_mi.get("sent latency inflation"))
         event["Latency Ratio"] = float(sender_mi.get("latency ratio"))
         event["Send Ratio"] = float(sender_mi.get("send ratio"))
+        event["Last Queue"] = float(sender_mi.get("last queue"))
         #event["Cwnd"] = sender_mi.cwnd
         #event["Cwnd Used"] = sender_mi.cwnd_used
         self.event_record["Events"].append(event)
         if event["Latency"] > 0.0:
             self.run_dur = 0.5 * sender_mi.get("avg latency")
-        #print("Sender obs: %s" % sender_obs)
+        # print("Sender obs: %s" % sender_obs)
 
         should_stop = False
 
@@ -456,7 +529,7 @@ class SimulatedNetworkEnv(gym.Env):
     def create_new_links_and_senders(self):
         bw    = random.uniform(self.min_bw, self.max_bw)
         lat   = random.uniform(self.min_lat, self.max_lat)
-        queue = 1 + int(np.exp(random.uniform(self.min_queue, self.max_queue)))
+        queue = random.uniform(self.min_queue, self.max_queue)
         loss  = random.uniform(self.min_loss, self.max_loss)
         #bw    = 200
         #lat   = 0.03
@@ -466,7 +539,7 @@ class SimulatedNetworkEnv(gym.Env):
         #self.senders = [Sender(0.3 * bw, [self.links[0], self.links[1]], 0, self.history_len)]
         #self.senders = [Sender(random.uniform(0.2, 0.7) * bw, [self.links[0], self.links[1]], 0, self.history_len)]
         self.senders = [Sender(random.uniform(0.3, 1.5) * bw, [self.links[0], self.links[1]], 0, self.features, history_len=self.history_len)]
-        self.run_dur = 3 * lat
+        self.run_dur = lat # Should be even smaller than this for queueing effects?
 
     def reset(self, seed=None, options=None):
         if seed is not None:

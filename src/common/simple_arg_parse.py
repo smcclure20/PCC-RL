@@ -29,6 +29,10 @@ def arg_or_default(arg, default=None):
             return int(result)
         if isinstance(default, float):
             return float(result)
+        if isinstance(default, str):
+            return str(result)
+        if isinstance(default, bool):
+            return bool(result)
         return result
     else:
         return default
